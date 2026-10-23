@@ -236,7 +236,10 @@ static bool ReadSwitchProBatteryHID(int* outPct, bool* outConnected) {
                     BYTE subcmd[64] = {0};
                     subcmd[0] = 0x01;
                     subcmd[1] = (++s_pktNum) & 0x0F;
-                    subcmd[10] = 0x50;
+                    subcmd[2] = 0x00; subcmd[3] = 0x01; subcmd[4] = 0x40; subcmd[5] = 0x40;
+                    subcmd[6] = 0x00; subcmd[7] = 0x01; subcmd[8] = 0x40; subcmd[9] = 0x40;
+                    subcmd[10] = 0x03; // Subcmd 0x03: Set Input Report Mode
+                    subcmd[11] = 0x30; // 0x30 = Standard full report (battery, IMU, buttons)
                     OVERLAPPED ovW = {0};
                     ovW.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
                     DWORD bw = 0;
@@ -252,6 +255,26 @@ static bool ReadSwitchProBatteryHID(int* outPct, bool* outConnected) {
                     continue;
                 }
             }
+        }
+        if (bytesRead >= 1 && buf[0] == 0x3F) {
+            // Controller is in Simple Mode after boot/reconnect; wake it into Standard Report Mode
+            BYTE subcmd[64] = {0};
+            subcmd[0] = 0x01;
+            subcmd[1] = (++s_pktNum) & 0x0F;
+            subcmd[2] = 0x00; subcmd[3] = 0x01; subcmd[4] = 0x40; subcmd[5] = 0x40;
+            subcmd[6] = 0x00; subcmd[7] = 0x01; subcmd[8] = 0x40; subcmd[9] = 0x40;
+            subcmd[10] = 0x03; // Subcmd 0x03: Set Input Report Mode
+            subcmd[11] = 0x30; // 0x30 = Standard full report
+            OVERLAPPED ovW = {0};
+            ovW.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+            DWORD bw = 0;
+            if (!WriteFile(hDev, subcmd, 49, &bw, &ovW)) {
+                if (GetLastError() == ERROR_IO_PENDING) {
+                    WaitForSingleObject(ovW.hEvent, 100);
+                }
+            }
+            CloseHandle(ovW.hEvent);
+            continue;
         }
         if (bytesRead >= 3 && (buf[0] == 0x30 || buf[0] == 0x21)) {
             BYTE batByte = buf[2];
@@ -657,8 +680,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int nCmdSh
     HANDLE hMutex = CreateMutexW(NULL, TRUE, L"Local\\SwitchControllerBattery_Mutex");
     bool alreadyRunning = (!hMutex || GetLastError() == ERROR_ALREADY_EXISTS);
 
-    // If launched manually and already running in background, notify or just exit
-    if (alreadyRunning && isBackground) return 0;
+    // If already running, prevent duplicate daemon thread and handle contention
+    if (alreadyRunning) {
+        if (isBackground) return 0;
+        HWND existingWnd = FindWindowW(L"SwitchControllerBatteryWndClass", NULL);
+        if (existingWnd) {
+            ShowWindow(existingWnd, SW_RESTORE);
+            SetForegroundWindow(existingWnd);
+            return 0;
+        }
+    }
 
     // Resolve local and AppContainer-accessible DLL staging path
     wchar_t localDllPath[MAX_PATH] = {0};

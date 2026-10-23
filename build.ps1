@@ -6,10 +6,15 @@ $compiler = $null
 $targetFlag = @()
 
 # Priorité au compilateur MinGW g++ pour une compatibilité parfaite
-if (Test-Path "C:\msys64\mingw64\bin\g++.exe") {
-    $compiler = "C:\msys64\mingw64\bin\g++.exe"
-} elseif (Get-Command g++ -ErrorAction SilentlyContinue) {
+$winlibsCandidate = Get-ChildItem -Path "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Filter "g++.exe" -Recurse -Depth 4 -ErrorAction SilentlyContinue | Select-Object -First 1
+if (Get-Command g++ -ErrorAction SilentlyContinue) {
     $compiler = "g++"
+} elseif (Test-Path "$env:LOCALAPPDATA\Microsoft\WinGet\Links\g++.exe") {
+    $compiler = "$env:LOCALAPPDATA\Microsoft\WinGet\Links\g++.exe"
+} elseif ($winlibsCandidate) {
+    $compiler = $winlibsCandidate.FullName
+} elseif (Test-Path "C:\msys64\mingw64\bin\g++.exe") {
+    $compiler = "C:\msys64\mingw64\bin\g++.exe"
 } elseif (Test-Path "C:\Program Files\Windhawk\Compiler\bin\clang++.exe") {
     $compiler = "C:\Program Files\Windhawk\Compiler\bin\clang++.exe"
     $targetFlag = @("--target=x86_64-w64-mingw32")
