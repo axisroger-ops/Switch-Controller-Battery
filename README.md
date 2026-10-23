@@ -23,6 +23,10 @@
   </a>
 </p>
 
+<p align="center">
+  <img src="demo.gif" alt="Switch Controller Battery Demo" width="600" />
+</p>
+
 ---
 
 ## 📌 Summary (GitHub About Description)
