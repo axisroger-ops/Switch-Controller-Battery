@@ -30,9 +30,10 @@ jobs:
           echo "C:\Program Files (x86)\Inno Setup 6" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Build C++ Binaries
-        shell: powershell
+        shell: msys2 {0}
         run: |
-          & ".\build.ps1"
+          g++ -shared -O2 -Os -s -fno-exceptions -fno-rtti SwitchControllerBatteryHook.cpp -o SwitchControllerBatteryHook.dll -lkernel32 -luser32
+          g++ -O2 -Os -s -fno-exceptions -fno-rtti -mwindows -municode SwitchControllerBattery.cpp -o SwitchControllerBattery.exe -lsetupapi -lhid -lcfgmgr32 -lkernel32 -luser32 -ldwmapi -lcomctl32
 
       - name: Build Inno Setup Installer (.exe)
         shell: powershell
