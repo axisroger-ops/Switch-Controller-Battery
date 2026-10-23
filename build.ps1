@@ -1,26 +1,33 @@
 $ErrorActionPreference = "Stop"
 $dir = $PSScriptRoot
 
-# Locate clang++ compiler
-$clang = "clang++"
-$testClang = Get-Command clang++ -ErrorAction SilentlyContinue
-if (!$testClang) {
-    if (Test-Path "C:\Program Files\Windhawk\Compiler\bin\clang++.exe") {
-        $clang = "C:\Program Files\Windhawk\Compiler\bin\clang++.exe"
-    } elseif (Test-Path "C:\Program Files\LLVM\bin\clang++.exe") {
-        $clang = "C:\Program Files\LLVM\bin\clang++.exe"
-    } else {
-        $clang = $null
-    }
+# Locate compiler: clang++ or g++
+$compiler = $null
+$targetFlag = @()
+
+if (Get-Command clang++ -ErrorAction SilentlyContinue) {
+    $compiler = "clang++"
+    $targetFlag = @("--target=x86_64-w64-mingw32")
+} elseif (Get-Command g++ -ErrorAction SilentlyContinue) {
+    $compiler = "g++"
+} elseif (Test-Path "C:\msys64\mingw64\bin\g++.exe") {
+    $compiler = "C:\msys64\mingw64\bin\g++.exe"
+} elseif (Test-Path "C:\Program Files\Windhawk\Compiler\bin\clang++.exe") {
+    $compiler = "C:\Program Files\Windhawk\Compiler\bin\clang++.exe"
+    $targetFlag = @("--target=x86_64-w64-mingw32")
+} elseif (Test-Path "C:\Program Files\LLVM\bin\clang++.exe") {
+    $compiler = "C:\Program Files\LLVM\bin\clang++.exe"
+    $targetFlag = @("--target=x86_64-w64-mingw32")
 }
 
 Write-Host "Arrêt des instances en cours..."
 Stop-Process -Name "SwitchControllerBattery", "SwitchProBattery", "ShellHost", "SystemSettings" -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 400
 
-if ($clang) {
+if ($compiler) {
+    Write-Host "Compilation avec $compiler..."
     Write-Host "Compilation de SwitchControllerBatteryHook.dll..."
-    & $clang -shared --target=x86_64-w64-mingw32 -O2 -Os -s -fno-exceptions -fno-rtti `
+    & $compiler @targetFlag -shared -O2 -Os -s -fno-exceptions -fno-rtti `
         "$dir\SwitchControllerBatteryHook.cpp" `
         -o "$dir\SwitchControllerBatteryHook.dll" `
         -lruntimeobject -lkernel32 -luser32
@@ -28,14 +35,20 @@ if ($clang) {
     if ($LASTEXITCODE -ne 0) { throw "Erreur lors de la compilation de SwitchControllerBatteryHook.dll" }
 
     Write-Host "Compilation de SwitchControllerBattery.exe..."
-    & $clang --target=x86_64-w64-mingw32 -O2 -Os -s -fno-exceptions -fno-rtti -mwindows -municode `
+    & $compiler @targetFlag -O2 -Os -s -fno-exceptions -fno-rtti -mwindows -municode `
         "$dir\SwitchControllerBattery.cpp" `
         -o "$dir\SwitchControllerBattery.exe" `
         -lsetupapi -lhid -lcfgmgr32 -lkernel32 -luser32 -ldwmapi -lcomctl32
 
     if ($LASTEXITCODE -ne 0) { throw "Erreur lors de la compilation de SwitchControllerBattery.exe" }
 } else {
-    Write-Host "clang++ non détecté : déploiement direct des binaires précompilés..."
+    Write-Host "Compilateur non détecté : utilisation des binaires existants..."
+}
+
+# En environnement d'intégration continue (GitHub Actions), on s'arrête ici
+if ($env:GITHUB_ACTIONS) {
+    Write-Host "CI : Binaires générés avec succès pour la release GitHub."
+    exit 0
 }
 
 # Déploiement propre dans C:\ProgramData\SwitchControllerBattery
