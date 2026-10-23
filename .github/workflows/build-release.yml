@@ -6,6 +6,9 @@ on:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -27,17 +30,18 @@ jobs:
       - name: Build Inno Setup Installer (.exe)
         shell: powershell
         run: |
-          iscc ".\installer.iss"
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" ".\installer.iss"
 
       - name: Package Portable ZIP
         shell: powershell
         run: |
           $ver = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "v1.0.0" }
-          $zipName = "SwitchControllerBattery-$ver-Portable.zip"
+          $zipName = "SwitchControllerBattery-$ver.zip"
           $files = @(
             "SwitchControllerBattery.exe",
             "SwitchControllerBatteryHook.dll",
             "install.ps1",
+            "uninstall.ps1",
             "build.ps1",
             "app.ico",
             "LICENSE",
@@ -51,7 +55,8 @@ jobs:
         with:
           files: |
             SwitchControllerBattery-Setup-*.exe
-            SwitchControllerBattery-*-Portable.zip
+            SwitchControllerBattery-*.zip
           draft: false
           prerelease: false
           generate_release_notes: true
+

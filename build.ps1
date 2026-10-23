@@ -87,5 +87,7 @@ Set-ItemProperty -Path $uninstallKey -Name "EstimatedSize" -Value 180 -Type DWor
 Remove-Item "$dir\SwitchPro*.*" -Force -ErrorAction SilentlyContinue
 
 Write-Host "SUCCÈS: Switch Controller Battery installé et enregistré dans Windows !"
-Write-Host "Ouverture de la fenêtre de configuration..."
-Start-Process -FilePath "$stageDir\SwitchControllerBattery.exe"
+if (!$env:GITHUB_ACTIONS) {
+    Write-Host "Ouverture de la fenêtre de configuration..."
+    Start-Process -FilePath "$stageDir\SwitchControllerBattery.exe"
+}
