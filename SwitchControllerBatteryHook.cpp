@@ -111,10 +111,10 @@ static bool IsProController(void* pThis) {
         const wchar_t* raw = WindowsGetStringRawBuffer(hStr, &len);
         bool match = false;
         if (raw && len > 0) {
-            // Match generically by Vendor ID (057E) or device display name
-            if (wcsstr(raw, L"Pro Controller") ||
-                wcsstr(raw, L"057e") || wcsstr(raw, L"057E") ||
-                wcsstr(raw, L"VID_057E") || wcsstr(raw, L"vid_057e")) {
+            if (wcsstr(raw, L"b3834368") || wcsstr(raw, L"B3834368") ||
+                wcsstr(raw, L"DC68EBF2289D") || wcsstr(raw, L"dc68ebf2289d") ||
+                wcsstr(raw, L"Pro Controller") ||
+                wcsstr(raw, L"057e") || wcsstr(raw, L"057E")) {
                 match = true;
             }
         }

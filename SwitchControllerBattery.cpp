@@ -591,7 +591,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int nCmdSh
         }
     }
 
-    HMODULE hLocalDll = LoadLibraryExW(localDllPath, NULL, DONT_RESOLVE_DLL_REFERENCES);
+    HMODULE hLocalDll = LoadLibraryExW(g_dllPath, NULL, DONT_RESOLVE_DLL_REFERENCES);
     if (!hLocalDll) return 1;
     void* pExport = (void*)GetProcAddress(hLocalDll, "g_SwitchBatteryLevel");
     if (!pExport) return 2;
