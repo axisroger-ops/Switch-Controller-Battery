@@ -5,18 +5,16 @@ $dir = $PSScriptRoot
 $compiler = $null
 $targetFlag = @()
 
-if (Get-Command clang++ -ErrorAction SilentlyContinue) {
-    $compiler = "clang++"
-    $targetFlag = @("--target=x86_64-w64-mingw32")
+# Priorité au compilateur MinGW g++ pour une compatibilité parfaite
+if (Test-Path "C:\msys64\mingw64\bin\g++.exe") {
+    $compiler = "C:\msys64\mingw64\bin\g++.exe"
 } elseif (Get-Command g++ -ErrorAction SilentlyContinue) {
     $compiler = "g++"
-} elseif (Test-Path "C:\msys64\mingw64\bin\g++.exe") {
-    $compiler = "C:\msys64\mingw64\bin\g++.exe"
 } elseif (Test-Path "C:\Program Files\Windhawk\Compiler\bin\clang++.exe") {
     $compiler = "C:\Program Files\Windhawk\Compiler\bin\clang++.exe"
     $targetFlag = @("--target=x86_64-w64-mingw32")
-} elseif (Test-Path "C:\Program Files\LLVM\bin\clang++.exe") {
-    $compiler = "C:\Program Files\LLVM\bin\clang++.exe"
+} elseif (Get-Command clang++ -ErrorAction SilentlyContinue) {
+    $compiler = "clang++"
     $targetFlag = @("--target=x86_64-w64-mingw32")
 }
 
@@ -30,7 +28,7 @@ if ($compiler) {
     & $compiler @targetFlag -shared -O2 -Os -s -fno-exceptions -fno-rtti `
         "$dir\SwitchControllerBatteryHook.cpp" `
         -o "$dir\SwitchControllerBatteryHook.dll" `
-        -lruntimeobject -lkernel32 -luser32
+        -lkernel32 -luser32
 
     if ($LASTEXITCODE -ne 0) { throw "Erreur lors de la compilation de SwitchControllerBatteryHook.dll" }
 

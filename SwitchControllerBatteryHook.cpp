@@ -1,11 +1,35 @@
 // SwitchControllerBatteryHook.cpp - Ultra-lightweight WinRT ABI Hook DLL (~14 KB, Zero dependencies)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <winstring.h>
 #include <stdlib.h>
 #include <wchar.h>
 
-#pragma comment(lib, "RuntimeObject.lib")
+#ifndef _HSTRING_DEFINED
+DECLARE_HANDLE(HSTRING);
+#endif
+
+typedef PCWSTR (WINAPI *WindowsGetStringRawBuffer_t)(HSTRING string, UINT32 *length);
+typedef HRESULT (WINAPI *WindowsDeleteString_t)(HSTRING string);
+
+static PCWSTR SafeGetStringRawBuffer(HSTRING hStr, UINT32* pLen) {
+    static WindowsGetStringRawBuffer_t fn = nullptr;
+    if (!fn) {
+        HMODULE hMod = GetModuleHandleW(L"combase.dll");
+        if (!hMod) hMod = LoadLibraryW(L"api-ms-win-core-winrt-string-l1-1-0.dll");
+        if (hMod) fn = (WindowsGetStringRawBuffer_t)GetProcAddress(hMod, "WindowsGetStringRawBuffer");
+    }
+    return fn ? fn(hStr, pLen) : nullptr;
+}
+
+static void SafeDeleteString(HSTRING hStr) {
+    static WindowsDeleteString_t fn = nullptr;
+    if (!fn) {
+        HMODULE hMod = GetModuleHandleW(L"combase.dll");
+        if (!hMod) hMod = LoadLibraryW(L"api-ms-win-core-winrt-string-l1-1-0.dll");
+        if (hMod) fn = (WindowsDeleteString_t)GetProcAddress(hMod, "WindowsDeleteString");
+    }
+    if (fn) fn(hStr);
+}
 
 // Exported shared state updated directly by SwitchControllerBattery.exe via WriteProcessMemory
 extern "C" __declspec(dllexport) volatile LONG g_SwitchBatteryLevel = -1;
@@ -118,7 +142,7 @@ static bool IsProController(void* pThis) {
     HSTRING hStr = NULL;
     if (SUCCEEDED(fnGetId(pThis, &hStr)) && hStr) {
         UINT32 len = 0;
-        const wchar_t* raw = WindowsGetStringRawBuffer(hStr, &len);
+        const wchar_t* raw = SafeGetStringRawBuffer(hStr, &len);
         bool match = false;
         if (raw && len > 0) {
             if (wcsstr(raw, L"b3834368") || wcsstr(raw, L"B3834368") ||
@@ -128,7 +152,7 @@ static bool IsProController(void* pThis) {
                 match = true;
             }
         }
-        WindowsDeleteString(hStr);
+        SafeDeleteString(hStr);
 
         s_cachedThis = pThis;
         s_cachedResult = match;
