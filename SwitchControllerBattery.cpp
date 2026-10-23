@@ -667,11 +667,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int nCmdSh
     if (lastSlash) *(lastSlash + 1) = L'\0';
     wcscat(localDllPath, L"SwitchControllerBatteryHook.dll");
 
-    CreateDirectoryW(L"C:\\ProgramData\\SwitchControllerBattery", NULL);
-    wcscpy(g_dllPath, L"C:\\ProgramData\\SwitchControllerBattery\\SwitchControllerBatteryHook.dll");
-    if (!CopyFileW(localDllPath, g_dllPath, FALSE)) {
-        if (GetFileAttributesW(g_dllPath) == INVALID_FILE_ATTRIBUTES) {
-            wcscpy(g_dllPath, localDllPath);
+    // If installed in a custom or system directory, use local DLL directly
+    if (wcsstr(localDllPath, L"\\Users\\") == NULL && GetFileAttributesW(localDllPath) != INVALID_FILE_ATTRIBUTES) {
+        wcscpy(g_dllPath, localDllPath);
+    } else {
+        // Portable mode inside a user profile directory: stage to ProgramData for AppContainer safety
+        CreateDirectoryW(L"C:\\ProgramData\\SwitchControllerBattery", NULL);
+        wcscpy(g_dllPath, L"C:\\ProgramData\\SwitchControllerBattery\\SwitchControllerBatteryHook.dll");
+        if (!CopyFileW(localDllPath, g_dllPath, FALSE)) {
+            if (GetFileAttributesW(g_dllPath) == INVALID_FILE_ATTRIBUTES) {
+                wcscpy(g_dllPath, localDllPath);
+            }
         }
     }
 

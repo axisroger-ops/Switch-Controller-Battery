@@ -1,0 +1,57 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Clang / LLVM & Inno Setup
+        run: |
+          choco install llvm innosetup -y
+          echo "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "C:\Program Files (x86)\Inno Setup 6" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Build C++ Binaries
+        shell: powershell
+        run: |
+          & ".\build.ps1"
+
+      - name: Build Inno Setup Installer (.exe)
+        shell: powershell
+        run: |
+          iscc ".\installer.iss"
+
+      - name: Package Portable ZIP
+        shell: powershell
+        run: |
+          $ver = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "v1.0.0" }
+          $zipName = "SwitchControllerBattery-$ver-Portable.zip"
+          $files = @(
+            "SwitchControllerBattery.exe",
+            "SwitchControllerBatteryHook.dll",
+            "install.ps1",
+            "build.ps1",
+            "app.ico",
+            "LICENSE",
+            "README.md"
+          )
+          Compress-Archive -Path $files -DestinationPath $zipName -Force
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            SwitchControllerBattery-Setup-*.exe
+            SwitchControllerBattery-*-Portable.zip
+          draft: false
+          prerelease: false
+          generate_release_notes: true

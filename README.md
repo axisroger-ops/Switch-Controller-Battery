@@ -8,6 +8,21 @@
   <strong>Native Windows 11 battery percentage indicator & control panel for Nintendo Switch Pro Controller — Ultra-lightweight, 0.00% CPU, ~1.5 MB RAM.</strong>
 </p>
 
+<p align="center">
+  <img src="https://img.shields.io/badge/Platform-Windows%2011-0078D4?logo=windows11&logoColor=white" alt="Windows 11" />
+  <img src="https://img.shields.io/badge/Language-C%2B%2B-00599C?logo=cplusplus&logoColor=white" alt="C++" />
+  <img src="https://img.shields.io/badge/CPU%20Usage-0.00%25-brightgreen" alt="0% CPU" />
+  <img src="https://img.shields.io/badge/RAM-~1.5%20MB-blue" alt="1.5 MB RAM" />
+  <img src="https://img.shields.io/badge/Dependencies-Zero-success" alt="Zero Dependencies" />
+  <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License" />
+</p>
+
+<p align="center">
+  <a href="../../releases/latest">
+    <img src="https://img.shields.io/badge/%E2%AC%87%EF%B8%8F_Download-Latest_Release_(v1.0.0)-blue?style=for-the-badge" alt="Download Latest Release" />
+  </a>
+</p>
+
 ---
 
 ## 📌 Summary (GitHub About Description)
