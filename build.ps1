@@ -65,4 +65,4 @@ Remove-Item "$dir\SwitchPro*.*" -Force -ErrorAction SilentlyContinue
 
 Write-Host "SUCCÈS: Switch Controller Battery installé !"
 Write-Host "Ouverture de la fenêtre de configuration..."
-Start-Process explorer.exe -ArgumentList "`"$dir\SwitchControllerBattery.exe`""
+Start-Process -FilePath "$dir\SwitchControllerBattery.exe"

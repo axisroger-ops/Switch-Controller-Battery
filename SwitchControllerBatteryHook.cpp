@@ -99,6 +99,16 @@ static HANDLE g_watcherThread = NULL;
 
 static bool IsProController(void* pThis) {
     if (!pThis || IsBadReadPtr(pThis, sizeof(void*))) return false;
+
+    // Fast cache: avoid re-allocating HSTRING for repeated calls on the same device object
+    static void* s_cachedThis = nullptr;
+    static bool  s_cachedResult = false;
+    static DWORD s_cachedTick = 0;
+    DWORD now = GetTickCount();
+    if (pThis == s_cachedThis && (now - s_cachedTick < 1500)) {
+        return s_cachedResult;
+    }
+
     void** vtable = *(void***)pThis;
     if (!vtable || IsBadReadPtr(vtable, sizeof(void*) * 10)) return false;
 
@@ -119,6 +129,10 @@ static bool IsProController(void* pThis) {
             }
         }
         WindowsDeleteString(hStr);
+
+        s_cachedThis = pThis;
+        s_cachedResult = match;
+        s_cachedTick = now;
         return match;
     }
     return false;

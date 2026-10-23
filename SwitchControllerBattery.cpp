@@ -86,6 +86,10 @@ static volatile LONG g_currentBattery = -1;
 static volatile bool g_isControllerConnected = false;
 static volatile bool g_isServiceEnabled = true;
 
+// Cached HID device path to avoid repeated SetupDi enumerations
+static wchar_t g_cachedDevicePath[512] = {0};
+static DEVINST g_cachedDevInst = 0;
+
 static bool IsHidDevInstConnected(DEVINST devInst) {
     DEVINST cur = devInst;
     for (int depth = 0; depth < 3 && cur != 0; depth++) {
@@ -114,12 +118,28 @@ static DWORD WINAPI PnpNotifyCallback(
     (void)hNotify; (void)Context; (void)EventData; (void)EventDataSize;
     if (Action == CM_NOTIFY_ACTION_DEVICEINTERFACEARRIVAL ||
         Action == CM_NOTIFY_ACTION_DEVICEINTERFACEREMOVAL) {
+        // Invalidate cached path on device arrival or removal
+        g_cachedDevicePath[0] = L'\0';
+        g_cachedDevInst = 0;
         if (g_hWakeEvent) SetEvent(g_hWakeEvent);
     }
     return ERROR_SUCCESS;
 }
 
-static bool CheckSwitchProConnectedFast() {
+static bool FindOrVerifySwitchPro(wchar_t* outPath, size_t outPathMax, DEVINST* outDevInst) {
+    // 1. Fast path: check cached device path first
+    if (g_cachedDevicePath[0] != L'\0' && g_cachedDevInst != 0) {
+        if (IsHidDevInstConnected(g_cachedDevInst)) {
+            if (outPath) wcsncpy(outPath, g_cachedDevicePath, outPathMax);
+            if (outDevInst) *outDevInst = g_cachedDevInst;
+            return true;
+        }
+        // Device node reports disconnected -> invalidate cache
+        g_cachedDevicePath[0] = L'\0';
+        g_cachedDevInst = 0;
+    }
+
+    // 2. Slow path: single enumeration of HID devices only when cache is cold
     GUID hidGuid;
     HidD_GetHidGuid(&hidGuid);
     HDEVINFO devInfo = SetupDiGetClassDevsW(&hidGuid, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
@@ -127,7 +147,7 @@ static bool CheckSwitchProConnectedFast() {
 
     SP_DEVICE_INTERFACE_DATA devInterfaceData;
     devInterfaceData.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
-    bool connected = false;
+    bool found = false;
 
     for (DWORD i = 0; SetupDiEnumDeviceInterfaces(devInfo, NULL, &hidGuid, i, &devInterfaceData); i++) {
         wchar_t buf[512];
@@ -139,134 +159,144 @@ static bool CheckSwitchProConnectedFast() {
         if (SetupDiGetDeviceInterfaceDetailW(devInfo, &devInterfaceData, detailData, sizeof(buf), NULL, &devInfoData)) {
             if (wcsstr(detailData->DevicePath, L"057e") || wcsstr(detailData->DevicePath, L"057E")) {
                 if (IsHidDevInstConnected(devInfoData.DevInst)) {
-                    connected = true;
+                    wcsncpy(g_cachedDevicePath, detailData->DevicePath, 512);
+                    g_cachedDevInst = devInfoData.DevInst;
+                    if (outPath) wcsncpy(outPath, detailData->DevicePath, outPathMax);
+                    if (outDevInst) *outDevInst = devInfoData.DevInst;
+                    found = true;
                     break;
                 }
             }
         }
     }
     SetupDiDestroyDeviceInfoList(devInfo);
-    return connected;
+    return found;
 }
 
 static bool ReadSwitchProBatteryHID(int* outPct, bool* outConnected) {
     *outConnected = false;
-    GUID hidGuid;
-    HidD_GetHidGuid(&hidGuid);
-    HDEVINFO devInfo = SetupDiGetClassDevsW(&hidGuid, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-    if (devInfo == INVALID_HANDLE_VALUE) return false;
+    wchar_t devPath[512] = {0};
+    DEVINST devInst = 0;
+    if (!FindOrVerifySwitchPro(devPath, 512, &devInst)) {
+        return false;
+    }
 
-    SP_DEVICE_INTERFACE_DATA devInterfaceData;
-    devInterfaceData.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
+    HANDLE hDev = CreateFileW(devPath,
+                              GENERIC_READ | GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+    if (hDev == INVALID_HANDLE_VALUE) {
+        hDev = CreateFileW(devPath,
+                           GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+    }
+    if (hDev == INVALID_HANDLE_VALUE) {
+        g_cachedDevicePath[0] = L'\0';
+        g_cachedDevInst = 0;
+        return false;
+    }
+
+    *outConnected = true;
+    BYTE buf[512];
+    OVERLAPPED ov = {0};
+    ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    DWORD startTick = GetTickCount();
+    static BYTE s_pktNum = 0;
     bool success = false;
 
-    for (DWORD i = 0; SetupDiEnumDeviceInterfaces(devInfo, NULL, &hidGuid, i, &devInterfaceData); i++) {
-        DWORD reqSize = 0;
-        SetupDiGetDeviceInterfaceDetailW(devInfo, &devInterfaceData, NULL, 0, &reqSize, NULL);
-        if (reqSize == 0) continue;
-
-        PSP_DEVICE_INTERFACE_DETAIL_DATA_W detailData = (PSP_DEVICE_INTERFACE_DETAIL_DATA_W)malloc(reqSize);
-        if (!detailData) continue;
-        detailData->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
-
-        SP_DEVINFO_DATA devInfoData = {0};
-        devInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
-
-        if (SetupDiGetDeviceInterfaceDetailW(devInfo, &devInterfaceData, detailData, reqSize, NULL, &devInfoData)) {
-            if (wcsstr(detailData->DevicePath, L"057e") || wcsstr(detailData->DevicePath, L"057E")) {
-                if (!IsHidDevInstConnected(devInfoData.DevInst)) {
-                    free(detailData);
-                    continue;
-                }
-                HANDLE hDev = CreateFileW(detailData->DevicePath,
-                                          GENERIC_READ | GENERIC_WRITE,
-                                          FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                          NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
-                if (hDev == INVALID_HANDLE_VALUE) {
-                    hDev = CreateFileW(detailData->DevicePath,
-                                       GENERIC_READ,
-                                       FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                       NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
-                }
-                if (hDev != INVALID_HANDLE_VALUE) {
-                    *outConnected = true;
-                    BYTE buf[512];
-                    OVERLAPPED ov = {0};
-                    ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
-                    DWORD startTick = GetTickCount();
-                    static BYTE s_pktNum = 0;
-
-                    while (GetTickCount() - startTick < 1500) {
-                        memset(buf, 0, sizeof(buf));
-                        ResetEvent(ov.hEvent);
-                        DWORD bytesRead = 0;
-                        BOOL r = ReadFile(hDev, buf, sizeof(buf), &bytesRead, &ov);
-                        if (!r) {
-                            DWORD err = GetLastError();
-                            if (err == ERROR_DEVICE_NOT_CONNECTED || err == ERROR_GEN_FAILURE) {
-                                *outConnected = false;
-                                break;
-                            }
-                            if (err == ERROR_IO_PENDING) {
-                                if (WaitForSingleObject(ov.hEvent, 250) == WAIT_OBJECT_0) {
-                                    if (!GetOverlappedResult(hDev, &ov, &bytesRead, FALSE)) {
-                                        DWORD err2 = GetLastError();
-                                        if (err2 == ERROR_DEVICE_NOT_CONNECTED || err2 == ERROR_GEN_FAILURE) {
-                                            *outConnected = false;
-                                            break;
-                                        }
-                                    }
-                                } else {
-                                    CancelIo(hDev);
-                                    DWORD dummy = 0;
-                                    GetOverlappedResult(hDev, &ov, &dummy, TRUE);
-                                    BYTE subcmd[64] = {0};
-                                    subcmd[0] = 0x01;
-                                    subcmd[1] = (++s_pktNum) & 0x0F;
-                                    subcmd[10] = 0x50;
-                                    OVERLAPPED ovW = {0};
-                                    ovW.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
-                                    DWORD bw = 0;
-                                    if (!WriteFile(hDev, subcmd, 49, &bw, &ovW)) {
-                                        if (GetLastError() == ERROR_IO_PENDING) {
-                                            if (WaitForSingleObject(ovW.hEvent, 50) != WAIT_OBJECT_0) {
-                                                CancelIo(hDev);
-                                                GetOverlappedResult(hDev, &ovW, &bw, TRUE);
-                                            }
-                                        }
-                                    }
-                                    CloseHandle(ovW.hEvent);
-                                    continue;
-                                }
-                            }
-                        }
-                        if (bytesRead >= 3 && (buf[0] == 0x30 || buf[0] == 0x21)) {
-                            BYTE batByte = buf[2];
-                            BYTE nibble = (batByte >> 4) & 0x0F;
-                            BYTE level = nibble & 0x0E;
-                            int pct = 50;
-                            switch (level) {
-                                case 8: pct = 100; break;
-                                case 6: pct = 75;  break;
-                                case 4: pct = 50;  break;
-                                case 2: pct = 25;  break;
-                                case 0: pct = 10;  break;
-                            }
-                            *outPct = pct;
-                            success = true;
+    while (GetTickCount() - startTick < 1500) {
+        memset(buf, 0, sizeof(buf));
+        ResetEvent(ov.hEvent);
+        DWORD bytesRead = 0;
+        BOOL r = ReadFile(hDev, buf, sizeof(buf), &bytesRead, &ov);
+        if (!r) {
+            DWORD err = GetLastError();
+            if (err == ERROR_DEVICE_NOT_CONNECTED || err == ERROR_GEN_FAILURE) {
+                *outConnected = false;
+                g_cachedDevicePath[0] = L'\0';
+                g_cachedDevInst = 0;
+                break;
+            }
+            if (err == ERROR_IO_PENDING) {
+                if (WaitForSingleObject(ov.hEvent, 250) == WAIT_OBJECT_0) {
+                    if (!GetOverlappedResult(hDev, &ov, &bytesRead, FALSE)) {
+                        DWORD err2 = GetLastError();
+                        if (err2 == ERROR_DEVICE_NOT_CONNECTED || err2 == ERROR_GEN_FAILURE) {
+                            *outConnected = false;
+                            g_cachedDevicePath[0] = L'\0';
+                            g_cachedDevInst = 0;
                             break;
                         }
                     }
-                    CloseHandle(ov.hEvent);
-                    CloseHandle(hDev);
+                } else {
+                    CancelIo(hDev);
+                    DWORD dummy = 0;
+                    GetOverlappedResult(hDev, &ov, &dummy, TRUE);
+                    BYTE subcmd[64] = {0};
+                    subcmd[0] = 0x01;
+                    subcmd[1] = (++s_pktNum) & 0x0F;
+                    subcmd[10] = 0x50;
+                    OVERLAPPED ovW = {0};
+                    ovW.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+                    DWORD bw = 0;
+                    if (!WriteFile(hDev, subcmd, 49, &bw, &ovW)) {
+                        if (GetLastError() == ERROR_IO_PENDING) {
+                            if (WaitForSingleObject(ovW.hEvent, 50) != WAIT_OBJECT_0) {
+                                CancelIo(hDev);
+                                GetOverlappedResult(hDev, &ovW, &bw, TRUE);
+                            }
+                        }
+                    }
+                    CloseHandle(ovW.hEvent);
+                    continue;
                 }
             }
         }
-        free(detailData);
-        if (success) break;
+        if (bytesRead >= 3 && (buf[0] == 0x30 || buf[0] == 0x21)) {
+            BYTE batByte = buf[2];
+            BYTE nibble = (batByte >> 4) & 0x0F;
+            BYTE level = nibble & 0x0E;
+            int pct = 50;
+            switch (level) {
+                case 8: pct = 100; break;
+                case 6: pct = 75;  break;
+                case 4: pct = 50;  break;
+                case 2: pct = 25;  break;
+                case 0: pct = 10;  break;
+            }
+            *outPct = pct;
+            success = true;
+            break;
+        }
     }
-    SetupDiDestroyDeviceInfoList(devInfo);
+    CloseHandle(ov.hEvent);
+    CloseHandle(hDev);
     return success;
+}
+
+// Target process tracking with handle and address caching
+struct TargetProcess {
+    DWORD pid;
+    HANDLE hProcess;
+    BYTE* remoteBase;
+    LONG lastBatteryWritten;
+};
+
+#define MAX_TARGETS 8
+static TargetProcess g_targets[MAX_TARGETS] = {0};
+static DWORD g_lastProcessScanTick = 0;
+
+static void CleanupDeadTargets() {
+    for (int i = 0; i < MAX_TARGETS; i++) {
+        if (g_targets[i].pid != 0) {
+            DWORD exitCode = 0;
+            if (!GetExitCodeProcess(g_targets[i].hProcess, &exitCode) || exitCode != STILL_ACTIVE) {
+                if (g_targets[i].hProcess) CloseHandle(g_targets[i].hProcess);
+                memset(&g_targets[i], 0, sizeof(TargetProcess));
+            }
+        }
+    }
 }
 
 static BYTE* FindRemoteModuleBase(DWORD pid, const wchar_t* modName) {
@@ -287,73 +317,106 @@ static BYTE* FindRemoteModuleBase(DWORD pid, const wchar_t* modName) {
     return base;
 }
 
-static DWORD g_attemptedPids[16] = {0};
-
-static bool HasAttemptedPid(DWORD pid) {
-    for (int i = 0; i < 16; i++) {
-        if (g_attemptedPids[i] == pid) return true;
-    }
-    return false;
-}
-
-static void MarkAttemptedPid(DWORD pid) {
-    static int s_idx = 0;
-    g_attemptedPids[s_idx] = pid;
-    s_idx = (s_idx + 1) & 15;
-}
-
-static void SyncProcessBattery(DWORD pid, LONG batteryLevel, bool injectIfMissing) {
-    BYTE* remoteBase = FindRemoteModuleBase(pid, L"SwitchControllerBatteryHook.dll");
-    HANDLE hProc = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ |
-                               PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION, FALSE, pid);
-    if (!hProc) return;
-
-    if (!remoteBase && injectIfMissing && !HasAttemptedPid(pid)) {
-        MarkAttemptedPid(pid);
-        size_t pathBytes = (wcslen(g_dllPath) + 1) * sizeof(wchar_t);
-        void* remoteMem = VirtualAllocEx(hProc, NULL, pathBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (remoteMem) {
-            if (WriteProcessMemory(hProc, remoteMem, g_dllPath, pathBytes, NULL)) {
-                HANDLE hThread = CreateRemoteThread(hProc, NULL, 0,
-                    (LPTHREAD_START_ROUTINE)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW"),
-                    remoteMem, 0, NULL);
-                if (hThread) {
-                    if (WaitForSingleObject(hThread, 250) == WAIT_OBJECT_0) {
-                        VirtualFreeEx(hProc, remoteMem, 0, MEM_RELEASE);
-                    }
-                    CloseHandle(hThread);
-                } else {
-                    VirtualFreeEx(hProc, remoteMem, 0, MEM_RELEASE);
-                }
-            } else {
-                VirtualFreeEx(hProc, remoteMem, 0, MEM_RELEASE);
+static void InjectTargetHook(TargetProcess* target) {
+    if (!target || !target->hProcess || target->remoteBase) return;
+    size_t pathBytes = (wcslen(g_dllPath) + 1) * sizeof(wchar_t);
+    void* remoteMem = VirtualAllocEx(target->hProcess, NULL, pathBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (remoteMem) {
+        if (WriteProcessMemory(target->hProcess, remoteMem, g_dllPath, pathBytes, NULL)) {
+            HANDLE hThread = CreateRemoteThread(target->hProcess, NULL, 0,
+                (LPTHREAD_START_ROUTINE)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW"),
+                remoteMem, 0, NULL);
+            if (hThread) {
+                WaitForSingleObject(hThread, 300);
+                CloseHandle(hThread);
             }
         }
-        remoteBase = FindRemoteModuleBase(pid, L"SwitchControllerBatteryHook.dll");
+        VirtualFreeEx(target->hProcess, remoteMem, 0, MEM_RELEASE);
     }
-
-    if (remoteBase && g_batteryVarRva != 0) {
-        SIZE_T written = 0;
-        WriteProcessMemory(hProc, remoteBase + g_batteryVarRva, &batteryLevel, sizeof(LONG), &written);
-    }
-
-    CloseHandle(hProc);
+    target->remoteBase = FindRemoteModuleBase(target->pid, L"SwitchControllerBatteryHook.dll");
+    target->lastBatteryWritten = -999;
 }
 
-static void BroadcastBatteryToTargets(LONG batteryLevel, bool injectIfMissing) {
+static void RefreshTargetProcesses(bool force) {
+    DWORD now = GetTickCount();
+    CleanupDeadTargets();
+
+    // Check if we already have an active ShellHost handle
+    bool hasShellHost = false;
+    for (int i = 0; i < MAX_TARGETS; i++) {
+        if (g_targets[i].pid != 0 && g_targets[i].remoteBase != nullptr) {
+            hasShellHost = true;
+            break;
+        }
+    }
+
+    // Only scan OS processes if forced, or missing ShellHost, or every 5 seconds (to detect newly opened Settings)
+    if (!force && hasShellHost && (now - g_lastProcessScanTick < 5000)) {
+        return;
+    }
+    g_lastProcessScanTick = now;
+
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap == INVALID_HANDLE_VALUE) return;
+
     PROCESSENTRY32W pe;
     pe.dwSize = sizeof(pe);
     if (Process32FirstW(hSnap, &pe)) {
         do {
-            if (_wcsicmp(pe.szExeFile, L"ShellHost.exe") == 0 ||
-                _wcsicmp(pe.szExeFile, L"SystemSettings.exe") == 0) {
-                SyncProcessBattery(pe.th32ProcessID, batteryLevel, injectIfMissing);
+            bool isTarget = (_wcsicmp(pe.szExeFile, L"ShellHost.exe") == 0 ||
+                             _wcsicmp(pe.szExeFile, L"SystemSettings.exe") == 0);
+            if (!isTarget) continue;
+
+            bool alreadyKnown = false;
+            for (int i = 0; i < MAX_TARGETS; i++) {
+                if (g_targets[i].pid == pe.th32ProcessID) {
+                    alreadyKnown = true;
+                    break;
+                }
+            }
+            if (alreadyKnown) continue;
+
+            for (int i = 0; i < MAX_TARGETS; i++) {
+                if (g_targets[i].pid == 0) {
+                    HANDLE hProc = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ |
+                                               PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION, FALSE, pe.th32ProcessID);
+                    if (hProc) {
+                        g_targets[i].pid = pe.th32ProcessID;
+                        g_targets[i].hProcess = hProc;
+                        g_targets[i].remoteBase = FindRemoteModuleBase(pe.th32ProcessID, L"SwitchControllerBatteryHook.dll");
+                        g_targets[i].lastBatteryWritten = -999;
+
+                        if (!g_targets[i].remoteBase) {
+                            InjectTargetHook(&g_targets[i]);
+                        }
+                    }
+                    break;
+                }
             }
         } while (Process32NextW(hSnap, &pe));
     }
     CloseHandle(hSnap);
+}
+
+static void BroadcastBatteryToTargets(LONG batteryLevel, bool forceRescan) {
+    RefreshTargetProcesses(forceRescan);
+
+    for (int i = 0; i < MAX_TARGETS; i++) {
+        if (g_targets[i].pid != 0 && g_targets[i].hProcess) {
+            if (!g_targets[i].remoteBase) {
+                InjectTargetHook(&g_targets[i]);
+            }
+            if (g_targets[i].remoteBase && g_batteryVarRva != 0) {
+                // Write ONLY if value actually changed or never synced
+                if (g_targets[i].lastBatteryWritten != batteryLevel) {
+                    SIZE_T written = 0;
+                    if (WriteProcessMemory(g_targets[i].hProcess, g_targets[i].remoteBase + g_batteryVarRva, &batteryLevel, sizeof(LONG), &written)) {
+                        g_targets[i].lastBatteryWritten = batteryLevel;
+                    }
+                }
+            }
+        }
+    }
 }
 
 static DWORD WINAPI DaemonThread(LPVOID) {
@@ -366,11 +429,16 @@ static DWORD WINAPI DaemonThread(LPVOID) {
     HCMNOTIFICATION hNotify = NULL;
     CM_Register_Notification(&filter, NULL, PnpNotifyCallback, &hNotify);
 
+    // Initial injection into ShellHost so hooks are primed immediately
+    BroadcastBatteryToTargets(-1, true);
+
     int lastPct = -1;
     DWORD lastHidPollTick = 0;
 
     while (WaitForSingleObject(g_hStopDaemon, 0) == WAIT_TIMEOUT) {
-        bool connected = CheckSwitchProConnectedFast();
+        wchar_t devPath[512] = {0};
+        DEVINST devInst = 0;
+        bool connected = FindOrVerifySwitchPro(devPath, 512, &devInst);
         g_isControllerConnected = connected;
 
         if (!connected) {
@@ -379,12 +447,14 @@ static DWORD WINAPI DaemonThread(LPVOID) {
                 g_currentBattery = -1;
                 BroadcastBatteryToTargets(-1, false);
             }
+            // Controller not connected: deep sleep. Instant wake via Windows PnP event on plug/connect!
             HANDLE waits[2] = { g_hStopDaemon, g_hWakeEvent };
-            DWORD r = WaitForMultipleObjects(2, waits, FALSE, 1500);
+            DWORD r = WaitForMultipleObjects(2, waits, FALSE, 4000);
             if (r == WAIT_OBJECT_0) break;
             continue;
         }
 
+        // Controller connected: read battery every 15s (or immediately on first connect)
         DWORD now = GetTickCount();
         if (lastPct < 0 || (now - lastHidPollTick >= 15000)) {
             int newPct = -1;
@@ -396,18 +466,29 @@ static DWORD WINAPI DaemonThread(LPVOID) {
             } else if (!hidConn) {
                 lastPct = -1;
                 g_currentBattery = -1;
+                g_cachedDevicePath[0] = L'\0';
+                g_cachedDevInst = 0;
             }
         }
 
         if (lastPct >= 0 && g_isServiceEnabled) {
-            BroadcastBatteryToTargets((LONG)lastPct, true);
+            BroadcastBatteryToTargets((LONG)lastPct, false);
         } else if (!g_isServiceEnabled && lastPct >= 0) {
             BroadcastBatteryToTargets(-1, false);
         }
 
+        // Wait 1000 ms before next check, or instant wake on user refresh / PnP event
         HANDLE waits[2] = { g_hStopDaemon, g_hWakeEvent };
-        DWORD r = WaitForMultipleObjects(2, waits, FALSE, 400);
+        DWORD r = WaitForMultipleObjects(2, waits, FALSE, 1000);
         if (r == WAIT_OBJECT_0) break;
+    }
+
+    // Cleanup target handles
+    for (int i = 0; i < MAX_TARGETS; i++) {
+        if (g_targets[i].hProcess) {
+            CloseHandle(g_targets[i].hProcess);
+            g_targets[i].hProcess = NULL;
+        }
     }
 
     return 0;
@@ -542,6 +623,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 LRESULT checked = SendMessageW(g_hChkStartup, BM_GETCHECK, 0, 0);
                 SetRunOnStartup(checked == BST_CHECKED);
             } else if (wmId == IDC_BTN_REFRESH) {
+                g_cachedDevicePath[0] = L'\0';
+                g_cachedDevInst = 0;
+                g_lastProcessScanTick = 0;
                 if (g_hWakeEvent) SetEvent(g_hWakeEvent);
             }
             return 0;
