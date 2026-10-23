@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 $dir = $PSScriptRoot
 
 # Locate compiler: clang++ or g++
@@ -18,27 +18,35 @@ if (Test-Path "C:\msys64\mingw64\bin\g++.exe") {
     $targetFlag = @("--target=x86_64-w64-mingw32")
 }
 
-Write-Host "Arrêt des instances en cours..."
-Stop-Process -Name "SwitchControllerBattery", "SwitchProBattery", "ShellHost", "SystemSettings" -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 400
+if (!$env:GITHUB_ACTIONS) {
+    Write-Host "Arrêt des instances en cours..."
+    Stop-Process -Name "SwitchControllerBattery", "SwitchProBattery", "ShellHost", "SystemSettings" -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 400
+}
 
 if ($compiler) {
     Write-Host "Compilation avec $compiler..."
     Write-Host "Compilation de SwitchControllerBatteryHook.dll..."
-    & $compiler @targetFlag -shared -O2 -Os -s -fno-exceptions -fno-rtti `
+    & $compiler @targetFlag -shared -O2 -Os -s -fno-exceptions -fno-rtti -static-libgcc -static-libstdc++ `
         "$dir\SwitchControllerBatteryHook.cpp" `
         -o "$dir\SwitchControllerBatteryHook.dll" `
         -lkernel32 -luser32
 
-    if ($LASTEXITCODE -ne 0) { throw "Erreur lors de la compilation de SwitchControllerBatteryHook.dll" }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Échec de compilation de SwitchControllerBatteryHook.dll (code $LASTEXITCODE)"
+        exit 1
+    }
 
     Write-Host "Compilation de SwitchControllerBattery.exe..."
-    & $compiler @targetFlag -O2 -Os -s -fno-exceptions -fno-rtti -mwindows -municode `
+    & $compiler @targetFlag -O2 -Os -s -fno-exceptions -fno-rtti -static-libgcc -static-libstdc++ -mwindows -municode `
         "$dir\SwitchControllerBattery.cpp" `
         -o "$dir\SwitchControllerBattery.exe" `
         -lsetupapi -lhid -lcfgmgr32 -lkernel32 -luser32 -ldwmapi -lcomctl32
 
-    if ($LASTEXITCODE -ne 0) { throw "Erreur lors de la compilation de SwitchControllerBattery.exe" }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Échec de compilation de SwitchControllerBattery.exe (code $LASTEXITCODE)"
+        exit 1
+    }
 } else {
     Write-Host "Compilateur non détecté : utilisation des binaires existants..."
 }
