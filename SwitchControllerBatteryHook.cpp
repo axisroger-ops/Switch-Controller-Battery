@@ -32,7 +32,49 @@ static void SafeDeleteString(HSTRING hStr) {
 }
 
 // Exported shared state updated directly by SwitchControllerBattery.exe via WriteProcessMemory
-extern "C" __declspec(dllexport) volatile LONG g_SwitchBatteryLevel = -1;
+extern "C" {
+__declspec(dllexport) volatile LONG g_SwitchBatteryLevel = -1;
+__declspec(dllexport) wchar_t g_TargetContainerId[64] = {0};
+__declspec(dllexport) wchar_t g_TargetMacHex[32] = {0};
+}
+
+static wchar_t AsciiLower(wchar_t c) {
+    return (c >= L'A' && c <= L'Z') ? (wchar_t)(c + 32) : c;
+}
+
+static bool WcsContainsI(const wchar_t* haystack, const wchar_t* needle) {
+    if (!haystack || !needle || !needle[0]) return false;
+    for (const wchar_t* h = haystack; *h; h++) {
+        const wchar_t* hp = h;
+        const wchar_t* np = needle;
+        while (*hp && *np && AsciiLower(*hp) == AsciiLower(*np)) {
+            hp++;
+            np++;
+        }
+        if (*np == L'\0') return true;
+    }
+    return false;
+}
+
+static bool MatchMacFlexible(const wchar_t* haystack, const wchar_t* macHex) {
+    if (!haystack || !macHex || !macHex[0]) return false;
+    if (WcsContainsI(haystack, macHex)) return true;
+
+    // Also match colon-separated MAC form (xx:xx:xx:xx:xx:xx) if 12 hex digits
+    size_t len = wcslen(macHex);
+    if (len == 12) {
+        wchar_t colonMac[18];
+        int out = 0;
+        for (int i = 0; i < 12; i += 2) {
+            if (i > 0) colonMac[out++] = L':';
+            colonMac[out++] = macHex[i];
+            colonMac[out++] = macHex[i + 1];
+        }
+        colonMac[out] = L'\0';
+        if (WcsContainsI(haystack, colonMac)) return true;
+    }
+    return false;
+}
 
 typedef HRESULT (__fastcall *IDeviceBase_get_ShowBatteryStatus_t)(void* pThis, bool* outShow);
 typedef HRESULT (__fastcall *IDeviceBase_get_BatteryLife_t)(void* pThis, int* outBat);
@@ -119,18 +161,49 @@ static InlineHook20 g_hookShowBattery;
 static InlineHook20 g_hookBatteryLife;
 static volatile LONG g_hooksApplied = 0;
 static HANDLE g_stopEvent = NULL;
+static HANDLE g_dllLoadedEvent = NULL;
 static HANDLE g_watcherThread = NULL;
+static SRWLOCK g_cacheLock = SRWLOCK_INIT;
+
+static void ReadTargetFilters(wchar_t* outCid, size_t cidMax, wchar_t* outMac, size_t macMax) {
+    for (size_t i = 0; i < cidMax - 1; i++) {
+        wchar_t ch = g_TargetContainerId[i];
+        outCid[i] = ch;
+        if (ch == L'\0') break;
+    }
+    outCid[cidMax - 1] = L'\0';
+
+    for (size_t i = 0; i < macMax - 1; i++) {
+        wchar_t ch = g_TargetMacHex[i];
+        outMac[i] = ch;
+        if (ch == L'\0') break;
+    }
+    outMac[macMax - 1] = L'\0';
+}
 
 static bool IsProController(void* pThis) {
     if (!pThis || IsBadReadPtr(pThis, sizeof(void*))) return false;
 
-    // Fast cache: avoid re-allocating HSTRING for repeated calls on the same device object
+    wchar_t targetCid[64];
+    wchar_t targetMac[32];
+    ReadTargetFilters(targetCid, 64, targetMac, 32);
+
+    // Fast thread-safe cache keyed on pointer, active target filter, and short 500ms TTL
     static void* s_cachedThis = nullptr;
     static bool  s_cachedResult = false;
     static DWORD s_cachedTick = 0;
+    static wchar_t s_cachedCid[64] = {0};
+    static wchar_t s_cachedMac[32] = {0};
     DWORD now = GetTickCount();
-    if (pThis == s_cachedThis && (now - s_cachedTick < 1500)) {
-        return s_cachedResult;
+
+    AcquireSRWLockShared(&g_cacheLock);
+    bool cacheHit = (pThis == s_cachedThis && (now - s_cachedTick < 500) &&
+                     _wcsicmp(s_cachedCid, targetCid) == 0 &&
+                     _wcsicmp(s_cachedMac, targetMac) == 0);
+    bool cachedVal = s_cachedResult;
+    ReleaseSRWLockShared(&g_cacheLock);
+    if (cacheHit) {
+        return cachedVal;
     }
 
     void** vtable = *(void***)pThis;
@@ -145,18 +218,22 @@ static bool IsProController(void* pThis) {
         const wchar_t* raw = SafeGetStringRawBuffer(hStr, &len);
         bool match = false;
         if (raw && len > 0) {
-            if (wcsstr(raw, L"b3834368") || wcsstr(raw, L"B3834368") ||
-                wcsstr(raw, L"DC68EBF2289D") || wcsstr(raw, L"dc68ebf2289d") ||
-                wcsstr(raw, L"Pro Controller") ||
-                wcsstr(raw, L"057e") || wcsstr(raw, L"057E")) {
+            if ((targetCid[0] && WcsContainsI(raw, targetCid)) ||
+                (targetMac[0] && MatchMacFlexible(raw, targetMac)) ||
+                WcsContainsI(raw, L"Pro Controller") ||
+                WcsContainsI(raw, L"057e")) {
                 match = true;
             }
         }
         SafeDeleteString(hStr);
 
+        AcquireSRWLockExclusive(&g_cacheLock);
         s_cachedThis = pThis;
         s_cachedResult = match;
         s_cachedTick = now;
+        wcscpy(s_cachedCid, targetCid);
+        wcscpy(s_cachedMac, targetMac);
+        ReleaseSRWLockExclusive(&g_cacheLock);
         return match;
     }
     return false;
@@ -229,9 +306,87 @@ static void TryHookDataModel(HMODULE hMod) {
     }
 }
 
+typedef struct _MY_UNICODE_STRING {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR  Buffer;
+} MY_UNICODE_STRING;
+
+typedef struct _MY_LDR_DLL_LOADED_NOTIFICATION_DATA {
+    ULONG Flags;
+    const MY_UNICODE_STRING* FullDllName;
+    const MY_UNICODE_STRING* BaseDllName;
+    PVOID DllBase;
+    ULONG SizeOfImage;
+} MY_LDR_DLL_LOADED_NOTIFICATION_DATA;
+
+typedef union _MY_LDR_DLL_NOTIFICATION_DATA {
+    MY_LDR_DLL_LOADED_NOTIFICATION_DATA Loaded;
+    MY_LDR_DLL_LOADED_NOTIFICATION_DATA Unloaded;
+} MY_LDR_DLL_NOTIFICATION_DATA;
+
+typedef VOID (CALLBACK *PLDR_DLL_NOTIFICATION_FUNCTION)(
+    ULONG NotificationReason,
+    const MY_LDR_DLL_NOTIFICATION_DATA* NotificationData,
+    PVOID Context
+);
+typedef LONG (NTAPI *LdrRegisterDllNotification_t)(
+    ULONG Flags,
+    PLDR_DLL_NOTIFICATION_FUNCTION NotificationFunction,
+    PVOID Context,
+    PVOID* Cookie
+);
+typedef LONG (NTAPI *LdrUnregisterDllNotification_t)(PVOID Cookie);
+
+static VOID CALLBACK OnDllNotification(
+    ULONG NotificationReason,
+    const MY_LDR_DLL_NOTIFICATION_DATA* NotificationData,
+    PVOID)
+{
+    if (NotificationReason != 1 || !NotificationData || !NotificationData->Loaded.BaseDllName) return;
+    const MY_UNICODE_STRING* base = NotificationData->Loaded.BaseDllName;
+    static const wchar_t kTarget[] = L"DeviceFlows.DataModel.dll";
+    constexpr USHORT kTargetChars = 25;
+    if (!base->Buffer || base->Length != kTargetChars * sizeof(wchar_t)) return;
+    for (USHORT i = 0; i < kTargetChars; i++) {
+        if (AsciiLower(base->Buffer[i]) != AsciiLower(kTarget[i])) return;
+    }
+    if (g_dllLoadedEvent) SetEvent(g_dllLoadedEvent);
+}
+
 static DWORD WINAPI WatcherThread(LPVOID) {
+    HMODULE hDM = GetModuleHandleW(L"DeviceFlows.DataModel.dll");
+    if (hDM) {
+        TryHookDataModel(hDM);
+        return 0;
+    }
+
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    auto fnReg = hNtdll ? (LdrRegisterDllNotification_t)GetProcAddress(hNtdll, "LdrRegisterDllNotification") : nullptr;
+    auto fnUnreg = hNtdll ? (LdrUnregisterDllNotification_t)GetProcAddress(hNtdll, "LdrUnregisterDllNotification") : nullptr;
+
+    PVOID cookie = nullptr;
+    if (fnReg && fnUnreg && g_dllLoadedEvent && fnReg(0, OnDllNotification, NULL, &cookie) == 0 && cookie) {
+        for (;;) {
+            hDM = GetModuleHandleW(L"DeviceFlows.DataModel.dll");
+            if (hDM) {
+                TryHookDataModel(hDM);
+                break;
+            }
+            HANDLE waits[2] = { g_stopEvent, g_dllLoadedEvent };
+            DWORD r = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+            if (r == WAIT_OBJECT_0) break;
+            if (!GetModuleHandleW(L"DeviceFlows.DataModel.dll")) {
+                if (WaitForSingleObject(g_stopEvent, 5) != WAIT_TIMEOUT) break;
+            }
+        }
+        fnUnreg(cookie);
+        return 0;
+    }
+
+    // Fallback polling if LdrRegisterDllNotification is unavailable
     for (;;) {
-        HMODULE hDM = GetModuleHandleW(L"DeviceFlows.DataModel.dll");
+        hDM = GetModuleHandleW(L"DeviceFlows.DataModel.dll");
         if (hDM) {
             TryHookDataModel(hDM);
             break;
@@ -241,20 +396,25 @@ static DWORD WINAPI WatcherThread(LPVOID) {
     return 0;
 }
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID) {
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpvReserved) {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
         g_stopEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+        g_dllLoadedEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
         g_watcherThread = CreateThread(NULL, 0, WatcherThread, NULL, 0, NULL);
     } else if (ul_reason_for_call == DLL_PROCESS_DETACH) {
         if (g_stopEvent) SetEvent(g_stopEvent);
-        if (g_watcherThread) {
-            WaitForSingleObject(g_watcherThread, 1000);
-            CloseHandle(g_watcherThread);
+        if (lpvReserved == NULL) {
+            if (g_watcherThread) {
+                WaitForSingleObject(g_watcherThread, 1000);
+                CloseHandle(g_watcherThread);
+                g_watcherThread = NULL;
+            }
+            g_hookShowBattery.Uninstall();
+            g_hookBatteryLife.Uninstall();
+            if (g_dllLoadedEvent) CloseHandle(g_dllLoadedEvent);
+            if (g_stopEvent) CloseHandle(g_stopEvent);
         }
-        if (g_stopEvent) CloseHandle(g_stopEvent);
-        g_hookShowBattery.Uninstall();
-        g_hookBatteryLife.Uninstall();
     }
     return TRUE;
 }
